@@ -16,7 +16,7 @@ Optax-GaLore is an implementation of the Gradient Low-Rank Projection (GaLore) a
 To install Optax-GaLore, clone this repository and install the required dependencies:
 
 ```bash
-git clone https://github.com/yourusername/optax-galore.git
+git clone https://github.com/EleutherAI/optax-galore.git
 cd optax-galore
 pip install -r requirements.txt
 ```
