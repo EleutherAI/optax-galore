@@ -56,7 +56,7 @@ model parallelism, checkpointing, or offloading strategies.
 import jax
 import jax.numpy as jnp
 import optax
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Any, NamedTuple, Callable
 
 class ProjectionSpec:
     """
@@ -69,8 +69,27 @@ class ProjectionSpec:
     def __init__(self, first_dim: int, second_dim: int):
         self.first_dim = first_dim
         self.second_dim = second_dim
+    
+def create_rank_pytree(params: Any, rank: Union[int, Callable]) -> Any:
+    """
+    Create a rank pytree from a single value or a function.
 
-def reproject(parameters, r: int, dimension_pytree=None):
+    Args:
+        params: The parameter pytree to match the structure of.
+        rank: Either a single integer value to use for all leaves,
+              or a function that takes (leaf, path) and returns an integer.
+
+    Returns:
+        A pytree with the same structure as params, where each leaf is an integer rank.
+    """
+    if isinstance(rank, int):
+        return jax.tree_map(lambda _: rank, params)
+    elif callable(rank):
+        return jax.tree_map_with_path(lambda path, leaf: rank(leaf, path), params)
+    else:
+        raise ValueError("rank must be either an integer or a callable")
+
+def reproject(parameters, rank_pytree, dimension_pytree=None):
     """
     Compute a projection matrix pytree from a parameter pytree.
 
@@ -106,7 +125,7 @@ def reproject(parameters, r: int, dimension_pytree=None):
     rather than the spatial dimensions. The dimension_pytree allows you to
     specify this custom behavior.
     """
-    def project_leaf(leaf, spec):
+    def project_leaf(leaf, r, spec):
         if spec is None or leaf.ndim < 2:
             return None
         
@@ -124,7 +143,7 @@ def reproject(parameters, r: int, dimension_pytree=None):
     if dimension_pytree is None:
         dimension_pytree = jax.tree_map(lambda _: None, parameters)
     
-    return jax.tree_map(project_leaf, parameters, dimension_pytree)
+    return jax.tree_map(project_leaf, parameters, rank_pytree, dimension_pytree)
 
 def project_gradients(parameter_pytree, projection_pytree, dimension_pytree=None):
     """
@@ -161,6 +180,7 @@ def project_gradients(parameter_pytree, projection_pytree, dimension_pytree=None
     
     return jax.tree_map(project_leaf, parameter_pytree, projection_pytree, dimension_pytree)
 
+
 def project_back(update_pytree, projection_pytree, dimension_pytree):
     """
     Project the updates back to the original parameter space.
@@ -190,7 +210,6 @@ def project_back(update_pytree, projection_pytree, dimension_pytree):
         
         result = jax.vmap(jnp.matmul, in_axes=(0, 0))(proj_2d, update_2d)
         
-        # Reconstruct the original shape
         if spec is None:
             new_shape = update_shape[:-1] + (proj_shape[-2],)
         else:
@@ -202,6 +221,7 @@ def project_back(update_pytree, projection_pytree, dimension_pytree):
         dimension_pytree = jax.tree_map(lambda _: None, update_pytree)
     
     return jax.tree_map(project_back_leaf, update_pytree, projection_pytree, dimension_pytree)
+
 
 
 class GaLoreState(NamedTuple):
@@ -230,7 +250,8 @@ def galore_wrapper(
     """
     
     def init_fn(params):
-        projections = reproject(params, rank, dimension_pytree)
+        rank_pytree = rank if isinstance(rank, jax.tree_util.PyTreeDef) else create_rank_pytree(params, rank)
+        projections = reproject(params, rank_pytree, dimension_pytree)
         return GaLoreState(
             count=jnp.zeros([], jnp.int32),
             inner_state=base_optimizer.init(params),
@@ -240,9 +261,10 @@ def galore_wrapper(
     def update_fn(updates, state, params):
         count = optax.safe_int32_increment(state.count)
         should_update_projections = count % subspace_change_freq == 0
+        rank_pytree = rank if isinstance(rank, jax.tree_util.PyTreeDef) else create_rank_pytree(params, rank)
         projections = jax.lax.cond(
             should_update_projections,
-            lambda: reproject(updates, rank, dimension_pytree),
+            lambda: reproject(updates, rank_pytree, dimension_pytree),
             lambda: state.projections
         )
         
@@ -254,6 +276,7 @@ def galore_wrapper(
         return final_updates, GaLoreState(count, new_inner_state, projections)
 
     return optax.GradientTransformation(init_fn, update_fn)
+
 
 def galore(
     learning_rate: float,
