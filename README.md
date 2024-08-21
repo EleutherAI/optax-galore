@@ -1,5 +1,3 @@
-# WARNING WORK-IN-PROGRESS MOST OF THIS CODE DOES NOT YET WORK
-
 # Optax-GaLore
 
 Optax-GaLore is an implementation of the Gradient Low-Rank Projection (GaLore) algorithm for memory-efficient training of Large Language Models (LLMs). This project extends the Optax optimization library with GaLore functionality.
