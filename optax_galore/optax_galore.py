@@ -5,6 +5,9 @@ This module implements the Gradient Low-Rank Projection (GaLore) algorithm for m
 training of Large Language Models (LLMs). GaLore allows for full-parameter learning while being
 more memory-efficient than common low-rank adaptation methods like LoRA.
 
+You can find the original GaLore paper here: https://arxiv.org/abs/2403.03507
+and the pytorch repository (probably) here: https://github.com/jiaweizzhao/GaLore
+
 The key idea of GaLore is to project the high-dimensional gradients into a lower-dimensional
 space, perform optimization in this compact space, and then project the updates back to the
 original high-dimensional space. This approach significantly reduces the memory required for
@@ -48,9 +51,10 @@ Require: A layer weight matrix W ∈ R^(m×n) with m ≤ n. Step size η, scale 
 23: Return W_t
 END ALGORITHM
 
-This implementation allows for efficient training of large models on limited memory hardware,
-such as pre-training a 7B parameter model on consumer GPUs with 24GB memory without requiring
-model parallelism, checkpointing, or offloading strategies.
+This implementation allows for efficient fine-tuneing of large models on limited memory hardware.
+
+Take a look at the examples for how to combine optax-galore with 
+jax paralleism to train large models on individual nodes.
 """
 
 import jax
@@ -63,8 +67,11 @@ class ProjectionSpec:
     A class to specify the dimensions for projection operations.
 
     Attributes:
-        first_dim (int): The first dimension for projection.
-        second_dim (int): The second dimension for projection.
+        first_dim (int): The first dimension for projection: will be downsized to <rank>
+        second_dim (int): The second dimension for projection: will be used to compute U matrix, but not downsized 
+    
+    For example to shrink the last dimension in a n by m matrix, ProjectionSpec(1,0) would be appropriate
+    Default behavior when a projection spec is to assume ProjectionSpec(-2,-1) or to not project down at all
     """
     def __init__(self, first_dim: int, second_dim: int):
         self.first_dim = first_dim
@@ -83,28 +90,45 @@ def create_rank_pytree(params: Any, rank: Union[int, Callable]) -> Any:
         A pytree with the same structure as params, where each leaf is an integer rank.
     """
     if isinstance(rank, int):
-        return jax.tree_map(lambda _: rank, params)
+        return jax.tree.map(lambda _: rank, params)
     elif callable(rank):
-        return jax.tree_map_with_path(lambda path, leaf: rank(leaf, path), params)
+        return jax.tree_util.tree_map_with_path(lambda path, leaf: rank(leaf, path), params)
     else:
         raise ValueError("rank must be either an integer or a callable")
+
+def dim_permutation(dims, ndims):
+    # Create the permutation
+    perm = list(range(ndims))
+    
+    #move relevant dimensions to the end
+    dim0,dim1 = perm[dims[0]],perm[dims[1]]
+    l1,l2 = perm[-2],perm[-1]
+    perm[dims[0]],perm[dims[1]] = l1,l2 
+    perm[-2],perm[-1] = dim0,dim1
+    
+    assert dim0 != dim1, "identical dimensions provided in projection spec"
+    
+    return perm
+
+def dim_inv_permutation(dims, ndims):
+    perm = dim_permutation(dims, ndims)
+    # Create the inverse permutation
+    inv_perm = [0] * len(perm)
+    for i, p in enumerate(perm):
+        inv_perm[p] = i
+    return inv_perm 
 
 def reproject(parameters, rank_pytree, dimension_pytree=None):
     """
     Compute a projection matrix pytree from a parameter pytree.
 
     This function performs low-rank approximation on the parameter matrices
-    using Singular Value Decomposition (SVD). It's a key component of the
-    GaLore (Gradient Low-Rank Projection) optimization algorithm.
-
-    The function processes each leaf of the parameter pytree independently:
-    1. It reshapes the parameter tensor to a 2D matrix (or keeps it as is if already 2D).
-    2. Applies SVD to this matrix.
-    3. Returns the first 'r' left singular vectors as the projection matrix.
+    using Singular Value Decomposition (SVD).
 
     Args:
         parameters: A pytree of parameter tensors to be projected.
-        r (int): The rank of the projection, i.e., the number of singular vectors to keep.
+        rank_pytree: A pytree with the same structure as 'parameters', where each leaf
+                     specifies the rank to use for the corresponding parameter.
         dimension_pytree: Optional pytree specifying custom dimensions for projection.
             If None, the function uses the last two dimensions of each parameter tensor.
             If provided, it should have the same structure as 'parameters', with each
@@ -114,36 +138,37 @@ def reproject(parameters, rank_pytree, dimension_pytree=None):
     Returns:
         A pytree with the same structure as 'parameters', where each leaf is replaced
         by its corresponding projection matrix (or None if projection is not applicable).
-
-    The dimension_pytree allows for flexible specification of which dimensions to use
-    for projection in each parameter tensor. This is particularly useful for tensors
-    with more than 2 dimensions, where the default behavior of using the last two
-    dimensions might not be appropriate.
-
-    For example, in a 4D tensor representing a convolutional layer's weights,
-    you might want to project over the input and output channel dimensions,
-    rather than the spatial dimensions. The dimension_pytree allows you to
-    specify this custom behavior.
     """
     def project_leaf(leaf, r, spec):
-        if spec is None or leaf.ndim < 2:
+        if spec is None and leaf.ndim >= 2:
+            dims = (-2, -1)
+        elif spec is not None:
+            dims = (spec.first_dim, spec.second_dim)
+        else:
             return None
         
-        if dimension_pytree is None:
-            dims = (-2, -1)
-        else:
-            dims = (spec.first_dim, spec.second_dim)
+        perm = dim_permutation(dims,leaf.ndim)
+        inv_perm = dim_inv_permutation(dims, leaf.ndim)
         
-        shape = leaf.shape
-        leaf_2d = leaf.reshape(-1, shape[dims[0]], shape[dims[1]])
+        # Transpose the tensor
+        leaf_transposed = jnp.transpose(leaf, perm)
         
-        U, _, _ = jax.vmap(jnp.linalg.svd, in_axes=(0, None))(leaf_2d, full_matrices=False)
-        return U[..., :r]
+        # Perform SVD on the last two dimensions
+        U, _, _ = jnp.linalg.svd(leaf_transposed, full_matrices=False)
+        
+        # Take the first r columns
+        U_r = U[..., :r]
+        
+        # Apply the inverse permutation to U_r
+        U_r_original_order = jnp.transpose(U_r, inv_perm)
+        
+        return U_r_original_order
     
     if dimension_pytree is None:
-        dimension_pytree = jax.tree_map(lambda _: None, parameters)
+        dimension_pytree = jax.tree.map(lambda _: None, parameters)
     
-    return jax.tree_map(project_leaf, parameters, rank_pytree, dimension_pytree)
+    return jax.tree.map(project_leaf, parameters, rank_pytree, dimension_pytree)
+
 
 def project_gradients(parameter_pytree, projection_pytree, dimension_pytree=None):
     """
@@ -157,31 +182,33 @@ def project_gradients(parameter_pytree, projection_pytree, dimension_pytree=None
     Returns:
         The projected gradient pytree.
     """
-    def project_leaf(param, proj, spec):
-        if proj is None:
-            return param
-        
-        if dimension_pytree is None:
+    def project_leaf(grad, proj_mat, spec):
+        if spec is None and grad.ndim >= 2:
             dims = (-2, -1)
-        else:
+        elif spec is not None:
             dims = (spec.first_dim, spec.second_dim)
+        else:
+            return grad  # Copy the gradient if no projection is available
         
-        param_shape = param.shape
-        proj_shape = proj.shape
+        perm = dim_permutation(dims,grad.ndim)
+        inv_perm = dim_inv_permutation(dims, grad.ndim)
+        print("B",perm, inv_perm)
         
-        param_2d = param.reshape(-1, param_shape[dims[0]], param_shape[dims[1]])
-        proj_2d = proj.reshape(-1, proj_shape[-2], proj_shape[-1])
+        transpose_grad = jnp.transpose(grad, perm)
+        transpose_proj_mat = jnp.transpose(proj_mat, perm)
+
+        print("A",transpose_grad.shape, transpose_proj_mat.shape)
+        transpose_projection = jnp.einsum('...ij,...ik->...kj', transpose_grad, transpose_proj_mat)
+        projection = jnp.transpose(transpose_projection, inv_perm)
         
-        result = jax.vmap(jnp.matmul, in_axes=(0, 0))(jnp.transpose(proj_2d, (0, 2, 1)), param_2d)
-        return result.reshape(param_shape[:-2] + (-1,))
+        return projection
     
     if dimension_pytree is None:
-        dimension_pytree = jax.tree_map(lambda _: None, parameter_pytree)
+        dimension_pytree = jax.tree.map(lambda _: None, parameter_pytree)
     
-    return jax.tree_map(project_leaf, parameter_pytree, projection_pytree, dimension_pytree)
+    return jax.tree.map(project_leaf, parameter_pytree, projection_pytree, dimension_pytree)
 
-
-def project_back(update_pytree, projection_pytree, dimension_pytree):
+def project_back(update_pytree, projection_pytree, dimension_pytree=None):
     """
     Project the updates back to the original parameter space.
 
@@ -197,32 +224,32 @@ def project_back(update_pytree, projection_pytree, dimension_pytree):
         if proj is None:
             return update
         
-        if spec is None:
+        if spec is None and update.ndim >= 2:
             dims = (-2, -1)
-        else:
+        elif spec is not None:
             dims = (spec.first_dim, spec.second_dim)
-        
-        update_shape = update.shape
-        proj_shape = proj.shape
-        
-        update_2d = update.reshape(-1, update_shape[-1])
-        proj_2d = proj.reshape(-1, proj_shape[-2], proj_shape[-1])
-        
-        result = jax.vmap(jnp.matmul, in_axes=(0, 0))(proj_2d, update_2d)
-        
-        if spec is None:
-            new_shape = update_shape[:-1] + (proj_shape[-2],)
         else:
-            new_shape = update_shape[:dims[0]] + (proj_shape[-2],) + update_shape[dims[0]+1:]
+            return update
         
-        return result.reshape(new_shape)
+        perm = dim_permutation(dims, update.ndim)
+        inv_perm = dim_inv_permutation(dims, update.ndim)
+        
+        # Transpose the update and projection matrices
+        update_transposed = jnp.transpose(update, perm)
+        proj_transposed = jnp.transpose(proj, perm)
+        
+        # Perform the back-projection
+        back_projected = jnp.einsum('...ij,...jk->...ik', proj_transposed, update_transposed)
+        
+        # Apply the inverse permutation to get back to the original shape
+        result = jnp.transpose(back_projected, inv_perm)
+        
+        return result
     
     if dimension_pytree is None:
-        dimension_pytree = jax.tree_map(lambda _: None, update_pytree)
+        dimension_pytree = jax.tree.map(lambda _: None, update_pytree)
     
-    return jax.tree_map(project_back_leaf, update_pytree, projection_pytree, dimension_pytree)
-
-
+    return jax.tree.map(project_back_leaf, update_pytree, projection_pytree, dimension_pytree)
 
 class GaLoreState(NamedTuple):
     """State for the GaLore wrapper."""
@@ -276,7 +303,6 @@ def galore_wrapper(
         return final_updates, GaLoreState(count, new_inner_state, projections)
 
     return optax.GradientTransformation(init_fn, update_fn)
-
 
 def galore(
     learning_rate: float,

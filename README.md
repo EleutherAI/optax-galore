@@ -20,12 +20,12 @@ git clone https://github.com/EleutherAI/optax-galore.git
 cd optax-galore
 pip install -r requirements.txt
 ```
-
 ## Usage
 
 Here's a basic example of how to use Optax-GaLore in your project:
 
 ```python
+import jax
 import optax
 import optax_galore
 
@@ -46,17 +46,25 @@ optimizer = optax_galore.galore(
 # Initialize optimizer state
 opt_state = optimizer.init(params)
 
-# In your training loop:
-def train_step(params, opt_state, batch):
-    def loss_fn(params):
-        # Your model's loss calculation
-        return loss
+# Define the loss function
+def loss_fn(params, batch):
+    # Your model's loss calculation
+    return loss
 
-    loss, grads = jax.value_and_grad(loss_fn)(params)
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = optax.apply_updates(params, updates)
-    return params, opt_state, loss
+# Define the update function
+@jax.jit
+def update(params, opt_state, batch):
+    loss, grads = jax.value_and_grad(loss_fn)(params, batch)
+    updates, new_opt_state = optimizer.update(grads, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    return new_params, new_opt_state, loss
+
+# In your training loop:
+for batch in data_loader:
+    params, opt_state, loss = update(params, opt_state, batch)
 ```
+
+This updated usage example demonstrates how to create a jitted update function that includes the loss calculation, gradient computation, optimizer update, and parameter update. Using a jitted update function enables the compiler to optimize out the unprojected gradients to save memory (probably).
 
 ### Advanced Usage
 

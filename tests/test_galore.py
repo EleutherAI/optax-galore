@@ -5,7 +5,7 @@ import numpy as np
 from functools import partial
 from jax import random, grad, jit, vmap
 import pytest
-import optax_galore  # Your implemented module
+import optax_galore.optax_galore
 import time
 
 # Memory profiling
