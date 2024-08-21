@@ -27,7 +27,7 @@ Here's a basic example of how to use Optax-GaLore in your project:
 ```python
 import jax
 import optax
-import optax_galore
+import optax_galore.optax_galore as og
 
 # Define your model and loss function
 # ...
@@ -37,7 +37,7 @@ learning_rate = 0.001
 rank = 64
 subspace_change_freq = 1000
 
-optimizer = optax_galore.galore(
+optimizer = og.galore(
     learning_rate=learning_rate,
     rank=rank,
     subspace_change_freq=subspace_change_freq
