@@ -192,12 +192,10 @@ def project_gradients(parameter_pytree, projection_pytree, dimension_pytree=None
         
         perm = dim_permutation(dims,grad.ndim)
         inv_perm = dim_inv_permutation(dims, grad.ndim)
-        print("B",perm, inv_perm)
         
         transpose_grad = jnp.transpose(grad, perm)
         transpose_proj_mat = jnp.transpose(proj_mat, perm)
 
-        print("A",transpose_grad.shape, transpose_proj_mat.shape)
         transpose_projection = jnp.einsum('...ij,...ik->...kj', transpose_grad, transpose_proj_mat)
         projection = jnp.transpose(transpose_projection, inv_perm)
         
@@ -239,7 +237,7 @@ def project_back(update_pytree, projection_pytree, dimension_pytree=None):
         proj_transposed = jnp.transpose(proj, perm)
         
         # Perform the back-projection
-        back_projected = jnp.einsum('...ij,...jk->...ik', proj_transposed, update_transposed)
+        back_projected = jnp.einsum('...ij,...ki->...kj', update_transposed, proj_transposed)
         
         # Apply the inverse permutation to get back to the original shape
         result = jnp.transpose(back_projected, inv_perm)
@@ -279,9 +277,10 @@ def galore_wrapper(
     def init_fn(params):
         rank_pytree = rank if isinstance(rank, jax.tree_util.PyTreeDef) else create_rank_pytree(params, rank)
         projections = reproject(params, rank_pytree, dimension_pytree)
+        projected_params = project_gradients(params, projections, dimension_pytree)
         return GaLoreState(
             count=jnp.zeros([], jnp.int32),
-            inner_state=base_optimizer.init(params),
+            inner_state=base_optimizer.init(projected_params),
             projections=projections,
         )
 
@@ -314,7 +313,7 @@ def galore(
     subspace_change_freq: int = 1000,
     dimension_pytree: Optional[Any] = None,
 ) -> optax.GradientTransformation:
-    """GaLore optimizer (maintained for backwards compatibility)."""
+    """GaLore optimizer."""
     base_optimizer = optax.adam(learning_rate, b1, b2, eps, eps_root)
     return galore_wrapper(base_optimizer, rank, subspace_change_freq, dimension_pytree)
 
