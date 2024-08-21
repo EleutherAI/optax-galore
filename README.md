@@ -69,7 +69,8 @@ This updated usage example demonstrates how to create a jitted update function t
 For more control over the projection dimensions, you can use the `dimension_pytree` parameter:
 
 ```python
-from optax_galore import ProjectionSpec
+import optax_galore.optax_galore as og
+from optax_galore.optax_galore import ProjectionSpec
 
 dimension_pytree = {
     'conv1': {'w': ProjectionSpec(2, 3), 'b': None},
